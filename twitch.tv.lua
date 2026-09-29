@@ -29,7 +29,7 @@ local USHER_URL = "https://usher.ttvnw.net"
 local IS_WIN    = package.config:sub(1, 1) == "\\"
 -- Start on the best variant instead of ramping up from 160p
 -- (avoids a demuxer/decoder restart and PCR resync right after start)
-local OPTIONS   = { ":adaptive-logic=nearoptimal" } --OR :adaptive-logic=highest
+local OPTIONS   = { ":adaptive-logic=highest" } --OR :adaptive-logic=nearoptimal
 
 -- No string literals inside queries: the body must stay free of '\' and
 -- escaped quotes to survive shell quoting on Windows
