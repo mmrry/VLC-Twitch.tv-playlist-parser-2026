@@ -63,6 +63,14 @@ local function fail(msg)
     return {}
 end
 
+-- Copy of the shared OPTIONS plus per-item extras
+local function item_options(extra)
+    local opts = {}
+    for _, v in ipairs(OPTIONS) do opts[#opts + 1] = v end
+    for _, v in ipairs(extra or {}) do opts[#opts + 1] = v end
+    return opts
+end
+
 -- Quote a single shell argument (cmd.exe on Windows, sh elsewhere)
 local function quote(s)
     if IS_WIN then
@@ -89,10 +97,10 @@ local function gql(query, variables)
     if not pipe then
         return nil, "failed to run curl"
     end
-    local body = pipe:read("*a")
+    local resp = pipe:read("*a")
     pipe:close()
 
-    local obj, _, err = json.decode(body or "")
+    local obj, _, err = json.decode(resp or "")
     if not obj then
         return nil, "bad GQL response: " .. (err or "empty (is curl installed?)")
     end
@@ -100,6 +108,16 @@ local function gql(query, variables)
         return nil, "GQL error: " .. tostring(obj.errors[1].message)
     end
     return obj.data or {}, nil
+end
+
+-- Log ad-related flags the server put into the (signed, immutable) token
+local function log_token_flags(token)
+    local ok, t = pcall(function() return require("dkjson").decode(token.value) end)
+    if not ok or type(t) ~= "table" then return end
+    local function s(v) return tostring(v) end
+    vlc.msg.dbg("Twitch: token server_ads=" .. s(t.server_ads)
+        .. " show_ads=" .. s(t.show_ads) .. " hide_ads=" .. s(t.hide_ads)
+        .. " turbo=" .. s(t.turbo) .. " subscriber=" .. s(t.subscriber))
 end
 
 -- Build usher HLS master playlist URL from an access token
@@ -114,6 +132,21 @@ local function usher_url(path, token)
     }, "&")
 end
 
+-- Parse Twitch "t" parameter: 06h53m20s, 1h5m, 90s, 1234 -> seconds
+local function parse_timestamp(t)
+    if not t or t == "" then return nil end
+    if t:match("^%d+$") then return tonumber(t) end
+    if not t:match("^[%dhms]+$") then return nil end
+    local mult  = { h = 3600, m = 60, s = 1 }
+    local total, consumed = 0, 0
+    for num, unit in t:gmatch("(%d+)([hms])") do
+        total    = total + tonumber(num) * mult[unit]
+        consumed = consumed + #num + 1
+    end
+    if consumed ~= #t or total == 0 then return nil end
+    return total
+end
+
 local function parse_video(video_id)
     vlc.msg.dbg("Twitch: Loading video url for " .. video_id)
 
@@ -126,10 +159,18 @@ local function parse_video(video_id)
     if not token then
         return fail("no access token for video " .. video_id)
     end
+    log_token_flags(token)
+
+    local extra = {}
+    local start = parse_timestamp(vlc.path:match("[?&]t=([%w]+)"))
+    if start then
+        vlc.msg.dbg("Twitch: starting VOD at " .. start .. "s")
+        extra[#extra + 1] = ":start-time=" .. start
+    end
 
     local item = {
         path    = usher_url("/vod/" .. video_id .. ".m3u8", token),
-        options = OPTIONS,
+        options = item_options(extra),
         name = "Twitch: " .. video_id,
         url  = vlc.path,
     }
@@ -163,12 +204,13 @@ local function parse_stream(channel)
     if token.authorization and token.authorization.isForbidden then
         return fail("playback forbidden: " .. tostring(token.authorization.forbiddenReasonCode))
     end
+    log_token_flags(token)
 
     local bs   = user.broadcastSettings or {}
     local game = bs.game and bs.game.displayName
     return { {
         path        = usher_url("/api/channel/hls/" .. channel:lower() .. ".m3u8", token),
-        options     = OPTIONS,
+        options     = item_options(),
         name        = "Twitch: " .. user.displayName,
         artist      = user.displayName,
         nowplaying  = game and (user.displayName .. " playing " .. game),
