@@ -4,10 +4,11 @@ Resolve Twitch channel and video URLs to the actual stream URL
  Copyright © 2017 the VideoLAN team
 
  Author: Marvin Scholz <epirat07 at gmail dot com>
- 
+
  2026: rewritten for the GQL PlaybackAccessToken API (Helix/Kraken/api.* are gone)
+ 2026: server-side preroll skipping (VLC 3 can't cross the ad->live discontinuity)
  Author: mmrry <sl2007 at yandex dot com>
- 
+
  This program is free software; you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
  the Free Software Foundation; either version 2 of the License, or
@@ -27,6 +28,19 @@ local CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
 local GQL_URL   = "https://gql.twitch.tv/gql"
 local USHER_URL = "https://usher.ttvnw.net"
 local IS_WIN    = package.config:sub(1, 1) == "\\"
+
+-- Preroll skipping.
+-- Twitch stitches ads into the HLS playlist (server_ads=true in the token).
+-- The ad->live switch is an EXT-X-DISCONTINUITY with a large PTS jump, after
+-- which VLC 3 loses its reference clock: black screen, no audio.
+-- Workaround: wait until the preroll is over and hand VLC the media playlist
+-- of the same session, so playback starts at the live edge past the jump.
+local SKIP_PREROLL   = true
+local LIVE_DELAY_MS  = 6000   -- VLC starts this far behind the live edge (default 15000)
+local LIVE_MARGIN_S  = 4      -- extra live content required before handing over
+local PREROLL_MAX_S  = 90     -- give up waiting after this long
+local POLL_S         = 2      -- playlist poll interval
+
 -- Start on the best variant instead of ramping up from 160p
 -- (avoids a demuxer/decoder restart and PCR resync right after start)
 local OPTIONS   = { ":adaptive-logic=highest" } --OR :adaptive-logic=nearoptimal
@@ -79,6 +93,16 @@ local function quote(s)
     return "'" .. s:gsub("'", "'\\''") .. "'"
 end
 
+local function run(cmd)
+    local pipe = io.popen(cmd)
+    if not pipe then
+        return nil
+    end
+    local out = pipe:read("*a")
+    pipe:close()
+    return out
+end
+
 -- VLC's Lua API can't send POST requests or custom headers,
 -- so the GQL call goes through the system curl (bundled with Windows 10+)
 local function gql(query, variables)
@@ -93,14 +117,12 @@ local function gql(query, variables)
         GQL_URL,
     }, " ")
 
-    local pipe = io.popen(cmd)
-    if not pipe then
+    local resp = run(cmd)
+    if not resp then
         return nil, "failed to run curl"
     end
-    local resp = pipe:read("*a")
-    pipe:close()
 
-    local obj, _, err = json.decode(resp or "")
+    local obj, _, err = json.decode(resp)
     if not obj then
         return nil, "bad GQL response: " .. (err or "empty (is curl installed?)")
     end
@@ -110,10 +132,55 @@ local function gql(query, variables)
     return obj.data or {}, nil
 end
 
--- Log ad-related flags the server put into the (signed, immutable) token
-local function log_token_flags(token)
+-- Plain GET through curl, optionally after a delay (one process per poll).
+-- The URL goes through a curl config file: usher/playlist URLs are full of
+-- %XX escapes, which cmd.exe could expand as %VARIABLES%.
+-- No --compressed: the curl bundled with Windows is built without zlib, and
+-- without Accept-Encoding the playlist servers answer uncompressed.
+local function http_get(url, delay)
+    local cfg
+    if IS_WIN then
+        cfg = (os.getenv("TEMP") or os.getenv("TMP") or ".")
+            .. "\\vlc_twitch_" .. math.random(99999999) .. ".cfg"
+    else
+        cfg = os.tmpname()
+    end
+    local f = io.open(cfg, "w")
+    if not f then
+        return nil
+    end
+    f:write('url = "', url, '"\n')
+    f:close()
+
+    local prefix = ""
+    if delay and delay > 0 then
+        if IS_WIN then
+            prefix = "ping -n " .. (delay + 1) .. " 127.0.0.1 >nul & "
+        else
+            prefix = "sleep " .. delay .. "; "
+        end
+    end
+
+    local body = run(prefix .. "curl -sS --max-time 10 -K " .. quote(cfg))
+    os.remove(cfg)
+    if not body or body == "" then
+        return nil
+    end
+    return body
+end
+
+-- The access token value is a JSON document signed by Twitch
+local function decode_token(token)
     local ok, t = pcall(function() return require("dkjson").decode(token.value) end)
-    if not ok or type(t) ~= "table" then return end
+    if ok and type(t) == "table" then
+        return t
+    end
+    return nil
+end
+
+-- Log ad-related flags the server put into the (signed, immutable) token
+local function log_token_flags(t)
+    if not t then return end
     local function s(v) return tostring(v) end
     vlc.msg.dbg("Twitch: token server_ads=" .. s(t.server_ads)
         .. " show_ads=" .. s(t.show_ads) .. " hide_ads=" .. s(t.hide_ads)
@@ -130,6 +197,91 @@ local function usher_url(path, token)
         "player_backend=mediaplayer",
         "p=" .. math.random(9999999),
     }, "&")
+end
+
+-- Inspect a Twitch media playlist.
+-- Live segments are titled "live" (#EXTINF:2.000,live), stitched ads are not.
+local function scan_playlist(pl)
+    local segs, has_live = {}, false
+    for dur, title in pl:gmatch("#EXTINF:([%d%.]+),([^\r\n]*)") do
+        local live = (title == "live")
+        has_live = has_live or live
+        segs[#segs + 1] = { dur = tonumber(dur) or 0, live = live }
+    end
+
+    local tail, all_live = 0, true
+    for i = #segs, 1, -1 do
+        if not segs[i].live then
+            all_live = false
+            break
+        end
+        tail = tail + segs[i].dur
+    end
+
+    return {
+        count    = #segs,
+        has_live = has_live,
+        all_live = all_live,
+        tail     = tail,   -- seconds of uninterrupted live content at the end
+        marked   = pl:find('CLASS="twitch%-stitched%-ad"') ~= nil
+                or pl:find('ID="stitched%-ad%-') ~= nil,
+    }
+end
+
+-- Wait out a server-side preroll; returns the URL VLC should open
+-- and extra item options
+local function skip_preroll(master_url)
+    local master = http_get(master_url)
+    -- Twitch lists the source/best variant first
+    local variant = master and master:match("#EXT%-X%-STREAM%-INF:[^\n]*\n([^\r\n]+)")
+    if not variant then
+        vlc.msg.warn("Twitch: no variant in master playlist, preroll not skipped")
+        return master_url, {}
+    end
+
+    local extra  = { ":adaptive-livedelay=" .. LIVE_DELAY_MS }
+    local need   = LIVE_DELAY_MS / 1000 + LIVE_MARGIN_S
+    local waited = 0
+    local announced = false
+
+    while true do
+        local pl = http_get(variant, waited > 0 and POLL_S or 0)
+        if not pl then
+            vlc.msg.warn("Twitch: media playlist fetch failed, opening as is")
+            return variant, extra
+        end
+
+        local s = scan_playlist(pl)
+        if s.all_live and not s.marked then
+            -- no ad in this session at all: keep adaptive streaming via master
+            if announced then
+                return variant, extra
+            end
+            return master_url, {}
+        end
+        if not s.has_live and not s.marked then
+            -- segments carry no titles: nothing to judge by
+            return master_url, {}
+        end
+        if s.all_live or s.tail >= need then
+            vlc.msg.info(string.format(
+                "Twitch: preroll over after ~%ds, starting at live edge", waited))
+            return variant, extra
+        end
+
+        if not announced then
+            vlc.msg.info("Twitch: server-side preroll detected, waiting for live content")
+            announced = true
+        end
+        vlc.msg.dbg(string.format("Twitch: preroll... %d segments, %.1fs live at tail",
+            s.count, s.tail))
+
+        if waited >= PREROLL_MAX_S then
+            vlc.msg.warn("Twitch: preroll wait timed out, playback may stall at the ad boundary")
+            return variant, extra
+        end
+        waited = waited + POLL_S
+    end
 end
 
 -- Parse Twitch "t" parameter: 06h53m20s, 1h5m, 90s, 1234 -> seconds
@@ -159,7 +311,7 @@ local function parse_video(video_id)
     if not token then
         return fail("no access token for video " .. video_id)
     end
-    log_token_flags(token)
+    log_token_flags(decode_token(token))
 
     local extra = {}
     local start = parse_timestamp(vlc.path:match("[?&]t=([%w]+)"))
@@ -204,13 +356,21 @@ local function parse_stream(channel)
     if token.authorization and token.authorization.isForbidden then
         return fail("playback forbidden: " .. tostring(token.authorization.forbiddenReasonCode))
     end
-    log_token_flags(token)
+
+    local claims = decode_token(token)
+    log_token_flags(claims)
+
+    local path  = usher_url("/api/channel/hls/" .. channel:lower() .. ".m3u8", token)
+    local extra = {}
+    if SKIP_PREROLL and claims and claims.server_ads == true then
+        path, extra = skip_preroll(path)
+    end
 
     local bs   = user.broadcastSettings or {}
     local game = bs.game and bs.game.displayName
     return { {
-        path        = usher_url("/api/channel/hls/" .. channel:lower() .. ".m3u8", token),
-        options     = item_options(),
+        path        = path,
+        options     = item_options(extra),
         name        = "Twitch: " .. user.displayName,
         artist      = user.displayName,
         nowplaying  = game and (user.displayName .. " playing " .. game),
