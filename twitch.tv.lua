@@ -7,6 +7,7 @@ Resolve Twitch channel and video URLs to the actual stream URL
 
  2026: rewritten for the GQL PlaybackAccessToken API (Helix/Kraken/api.* are gone)
  2026: server-side preroll skipping (VLC 3 can't cross the ad->live discontinuity)
+ 2026: VLC 4 support (native discontinuity handling, preroll workaround disabled)
  Author: mmrry <sl2007 at yandex dot com>
 
  This program is free software; you can redistribute it and/or modify
@@ -31,15 +32,21 @@ local IS_WIN    = package.config:sub(1, 1) == "\\"
 -- Start on the best variant instead of ramping up from 160p
 -- (avoids a demuxer/decoder restart and PCR resync right after start)
 local OPTIONS   = { ":adaptive-logic=highest" } --OR :adaptive-logic=nearoptimal
--- Variant used for the preroll workaround (a media playlist has no other
--- qualities to switch to): highest resolution not above MAX_HEIGHT.
--- 0 = best available (source/1080p60).
+-- Highest resolution to play. 0 = best available (source/1080p60).
+-- Used for the preroll workaround (picks a media playlist) and passed to
+-- VLC as :adaptive-maxheight for normal playback.
 local MAX_HEIGHT = 0
+-- Distance from the live edge for normal playback, in ms.
+-- 0 = VLC default. Larger values (e.g. 15000) trade latency for fewer stalls:
+-- Twitch segments are 2s long and are often still being produced when VLC
+-- fetches them at the very edge.
+local LIVE_EDGE_DELAY_MS = 0
 
--- Preroll handling.
+-- Preroll handling (VLC 3 only).
 -- With server_ads=true Twitch stitches ads into the HLS playlist. The ad->live
 -- switch is an EXT-X-DISCONTINUITY with a large PTS jump, after which VLC 3
--- loses its reference clock (black screen, no audio).
+-- loses its reference clock (black screen, no audio). VLC 4 crosses it fine,
+-- so the workaround below is skipped there.
 -- Workaround: the preroll is played as a separate playlist item that stops
 -- just before the discontinuity (:run-time), then a second item re-enters
 -- this script, waits for live segments and opens the same session at the
@@ -84,10 +91,30 @@ local function fail(msg)
     return {}
 end
 
+-- Major VLC version (3, 4, ...).
+-- vlc.misc may not be exposed to playlist scripts in every version, so fall
+-- back to the Lua runtime: VLC 4 builds ship Lua 5.4, VLC 3 builds an older one.
+local vlc_major_cache
+local function vlc_major()
+    if vlc_major_cache then return vlc_major_cache end
+    local ok, v = pcall(function() return vlc.misc.version() end)
+    local major = ok and v and tonumber(tostring(v):match("^(%d+)"))
+    if not major then
+        local lv = tonumber((_VERSION or ""):match("(%d+%.%d+)")) or 5.1
+        major = (lv >= 5.4) and 4 or 3
+        vlc.msg.dbg("Twitch: VLC version unknown, guessed " .. major .. " from " .. tostring(_VERSION))
+    end
+    vlc_major_cache = major
+    return major
+end
+
 -- Copy of the shared OPTIONS plus per-item extras
 local function item_options(extra)
     local opts = {}
     for _, v in ipairs(OPTIONS) do opts[#opts + 1] = v end
+    if MAX_HEIGHT > 0 then
+        opts[#opts + 1] = ":adaptive-maxheight=" .. MAX_HEIGHT
+    end
     for _, v in ipairs(extra or {}) do opts[#opts + 1] = v end
     return opts
 end
@@ -242,8 +269,6 @@ local function scan_playlist(pl)
     }
 end
 
--- Poll the media playlist until enough live content sits at its tail.
--- Each poll is a full HTTPS request, which paces the loop by itself.
 -- How much live content must sit at the playlist tail so that VLC's start
 -- point lands past the ad->live discontinuity. VLC 3 never starts closer than
 -- 3 segments to the live edge (whatever adaptive-livedelay says) and rounds
@@ -253,6 +278,8 @@ local function live_needed(s)
     return math.max(LIVE_DELAY_MS / 1000, 3 * s.segdur) + s.segdur + LIVE_MARGIN_S
 end
 
+-- Poll the media playlist until enough live content sits at its tail.
+-- Each poll is a full HTTPS request, which paces the loop by itself.
 local function wait_live(variant, max_s)
     local started = os.time()
     local polls   = 0
@@ -463,14 +490,23 @@ local function parse_stream(channel)
         url         = vlc.path,
     }
 
-    if SKIP_PREROLL and claims and claims.server_ads == true then
+    -- VLC 4 handles the ad->live discontinuity itself (ad shown, then live,
+    -- mid-rolls included); the two-item workaround is only needed on VLC 3.
+    local major = vlc_major()
+    if SKIP_PREROLL and major < 4 and claims and claims.server_ads == true then
         local items = preroll_items(path, channel, meta)
         if items then
             return items
         end
+    elseif major >= 4 then
+        vlc.msg.dbg("Twitch: VLC " .. major .. ", preroll workaround not needed")
     end
 
-    return { with_meta(meta, { path = path, options = item_options() }) }
+    local extra = {}
+    if LIVE_EDGE_DELAY_MS > 0 then
+        extra[#extra + 1] = ":adaptive-livedelay=" .. LIVE_EDGE_DELAY_MS
+    end
+    return { with_meta(meta, { path = path, options = item_options(extra) }) }
 end
 
 function parse()
