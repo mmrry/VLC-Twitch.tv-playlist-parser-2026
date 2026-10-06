@@ -3,9 +3,9 @@ Updated Twitch.tv LUA plugin for VLC
 
 [Русский](README.md) | **English**
 
-A VLC playlist script that opens Twitch live channels and VODs directly in VLC.
+A VLC playlist script that opens Twitch live channels and VODs directly in VLC. Works with VLC 3.0 and VLC 4.0.
 
-It replaces the stock `twitch.lua` bundled with VLC 3.0. The stock script relies on the removed `api.twitch.tv/api/*` and Kraken endpoints, and those now fail with HTTP 410. This version uses the same flow as the Twitch web player: a GQL `PlaybackAccessToken` request, followed by the HLS master playlist from `usher.ttvnw.net`.
+It replaces the stock `twitch.lua` bundled with VLC. The stock script relies on the removed `api.twitch.tv/api/*` and Kraken endpoints, and those now fail with HTTP 410 (404 in VLC 4). This version uses the same flow as the Twitch web player: a GQL `PlaybackAccessToken` request, followed by the HLS master playlist from `usher.ttvnw.net`.
 
 ## Features
 
@@ -14,7 +14,8 @@ It replaces the stock `twitch.lua` bundled with VLC 3.0. The stock script relies
 - Fills in VLC metadata: *Title*, *Artist*, *Genre*, *Now Playing* and *Description*.
 - Prints clear errors to the VLC log for a missing channel, an offline stream, or a forbidden token (for example a geoblock).
 - Starts on the best quality right away. It skips the audio-only variant and uses `adaptive-logic=highest`, so there is no ramp-up from 160p, no demuxer restart and no PCR resync after the stream starts.
-- **Handles server-side prerolls.** Without this, VLC 3 shows a black screen with no audio once the ad ends. The script plays the ad as a separate item and then switches to the live stream past the break (see [Preroll ads](#preroll-ads)).
+- **Handles server-side prerolls on VLC 3.** Without this, VLC 3 shows a black screen with no audio once the ad ends. The script plays the ad as a separate item and then switches to the live stream past the break (see [Preroll ads](#preroll-ads)).
+- **Detects the VLC version.** VLC 4 crosses the ad-to-live switch on its own, so the workaround is turned off there automatically: prerolls, the live stream and mid-roll ads all play normally.
 - Runs on Windows, Linux and macOS.
 
 ## Supported URLs
@@ -31,7 +32,7 @@ Clips (`clips.twitch.tv`) are not supported and are deliberately left unmatched.
 
 ## Requirements
 
-- VLC 3.0.x.
+- VLC 3.0.x or VLC 4.0.
 - `curl` available on `PATH`. VLC's Lua API can only send GET requests without custom headers, so the GQL POST request is sent through the system `curl`. Playlists (including the live wait after an ad) are fetched by VLC itself, with no external processes.
 
 | OS | curl |
@@ -41,9 +42,11 @@ Clips (`clips.twitch.tv`) are not supported and are deliberately left unmatched.
 | Linux (distro package) | Usually preinstalled. If missing, run `sudo apt install curl` or the equivalent for your distro |
 | Linux (Flatpak / Snap) | VLC uses the curl from its sandbox runtime, which may not include one. See [Troubleshooting](#troubleshooting) |
 
+Mobile versions of VLC (Android, iOS, tvOS) are not supported: they have no system `curl`, and iOS and tvOS do not allow starting external programs.
+
 ## Installation
 
-Copy `twitch.lua` into your user playlist-scripts directory, creating the directory if needed:
+Copy `twitch.lua` into your user playlist-scripts directory, creating the directory if needed. The paths are the same for VLC 3 and VLC 4:
 
 | OS | Path |
 |---|---|
@@ -54,6 +57,8 @@ Copy `twitch.lua` into your user playlist-scripts directory, creating the direct
 | macOS | `~/Library/Application Support/org.videolan.vlc/lua/playlist/` |
 
 VLC loads user scripts before the bundled ones, so this file takes over from the built-in `twitch.luac` automatically. Restart VLC after installing.
+
+Use the `twitch.lua` source file, not a compiled `.luac`. VLC 3 and VLC 4 bytecode is not compatible (the log shows `bad binary format (version mismatch)`), while the source file works in both.
 
 ## Usage
 
@@ -68,26 +73,30 @@ VLC loads user scripts before the bundled ones, so this file takes over from the
 
 All settings are constants at the top of the script.
 
-### Quality
+### Quality and latency
 
 ```lua
-local OPTIONS    = { ":adaptive-logic=highest" }
-local MAX_HEIGHT = 0
+local OPTIONS            = { ":adaptive-logic=highest" }
+local MAX_HEIGHT         = 0
+local LIVE_EDGE_DELAY_MS = 0
 ```
 
-`OPTIONS` applies when VLC is given the master playlist (a normal start with no ad, and VODs):
+`OPTIONS` is added to every item the script creates:
 
 | Value | Behavior |
 |---|---|
 | `:adaptive-logic=highest` | Default. Plays the best variant from the first segment onward and never steps down |
 | `:adaptive-logic=nearoptimal` | Adapts to bandwidth. Better on unstable connections, but may start at a lower quality |
-| `:adaptive-logic=highest`, `:adaptive-maxheight=720` | Plays the best variant up to 720p |
 
-`MAX_HEIGHT` applies when the preroll workaround kicks in. VLC is then given a single media playlist of one quality, with nothing to switch to. The script picks the variant with the highest resolution (then frame rate, then bitrate) that does not exceed `MAX_HEIGHT`. `0` means the best available. The order of variants in Twitch's master playlist is not relied on, because it varies.
+`MAX_HEIGHT` caps the resolution; `0` means the best available. For normal playback and VODs the value is passed to VLC as `:adaptive-maxheight`. When the preroll workaround kicks in (VLC 3), VLC is given a single media playlist of one quality, and the script picks the variant with the highest resolution (then frame rate, then bitrate) that does not exceed `MAX_HEIGHT`. The order of variants in Twitch's master playlist is not relied on, because it varies.
+
+`LIVE_EDGE_DELAY_MS` sets the distance from the live edge for normal playback (`:adaptive-livedelay`); `0` keeps VLC's default. Twitch segments are 2 s long and are often still being produced when VLC fetches them at the very edge. If the stream stalls and rebuffers, set it to, for example, `15000`: latency goes up, and stalls become rarer.
 
 These options apply only to items this script creates. Global VLC settings are not changed.
 
 ### Preroll ads
+
+These settings apply to VLC 3 only. The workaround is not used on VLC 4.
 
 ```lua
 local SKIP_PREROLL  = true
@@ -117,14 +126,15 @@ local PREROLL_MAX_S = 90
 4. The script builds the usher URL from the token's `value` and `signature`:
    - live: `https://usher.ttvnw.net/api/channel/hls/<login>.m3u8?...`
    - VOD: `https://usher.ttvnw.net/vod/<id>.m3u8?...`
-5. For live channels, the script fetches the master playlist and the selected variant's media playlist, and checks whether the session starts with a stitched ad (`DATERANGE` tags of class `twitch-stitched-ad` and the segment titles).
-6. With no ad, it returns a playlist item with the metadata attached, and VLC's `adaptive` demuxer plays the HLS stream from there. With an ad, see below.
+5. The script detects the VLC version: through `vlc.misc.version()`, or, if that is not available to playlist scripts, from the bundled Lua version (VLC 4 builds ship Lua 5.4).
+6. On VLC 4 it returns a playlist item with the metadata attached right away, and VLC's `adaptive` demuxer plays the HLS stream, stitched ads included.
+7. On VLC 3, for live channels, the script fetches the master playlist and the selected variant's media playlist, and checks whether the session starts with a stitched ad (`DATERANGE` tags of class `twitch-stitched-ad` and the segment titles). With no ad, it returns a normal item. With an ad, see below.
 
 The request body contains no string literals, backslashes or newlines. All literal values are passed as GraphQL variables. This lets one quoting routine work safely for both `cmd.exe` and `sh`, without temporary files.
 
-### Preroll workaround
+### Preroll workaround (VLC 3)
 
-Anonymous tokens have `server_ads: true`, and Twitch stitches ads directly into the HLS stream. The switch from the ad to the live stream is an `EXT-X-DISCONTINUITY` with a large timestamp jump. VLC 3 loses its reference clock there: the log shows `Timestamp conversion failed … no reference clock`, and the screen stays black with no audio.
+Anonymous tokens have `server_ads: true`, and Twitch stitches ads directly into the HLS stream. The switch from the ad to the live stream is an `EXT-X-DISCONTINUITY` with a large timestamp jump. VLC 3 loses its reference clock there: the log shows `Timestamp conversion failed … no reference clock`, and the screen stays black with no audio. VLC 4 handles this switch correctly.
 
 The script works around this as follows:
 
@@ -150,13 +160,15 @@ Open *Tools → Messages* in VLC, or run `vlc -vv`, and look for lines starting 
 | `<name> is offline` | The channel is not live right now |
 | `playback forbidden: <code>` | The token was denied, for example because of a geoblock |
 | `no access token for video <id>` | The VOD does not exist or is not public |
-| `server-side preroll (Ns announced), playing it first` | An ad was detected and is shown as a separate item |
-| `server-side preroll of unknown length, waiting for live` | The ad length is unknown, so the script waits for the live stream without showing the ad |
-| `preroll done, switching to live` | The ad finished, and the script is waiting for live segments |
-| `live content ready after N poll(s), Ns` | The live stream is ready and VLC opens it (debug level) |
-| `variant <N>p chosen` | The quality picked for the preroll workaround (debug level) |
-| `live wait timed out, playback may stall at the ad boundary` | The live stream did not appear in time. A black screen is possible; reopen the URL |
-| `master playlist unreadable, preroll not handled` / `media playlist unreadable, preroll not handled` | A playlist failed to load, so the script runs without the ad workaround |
+| `VLC 4, preroll workaround not needed` | VLC 4 detected; ads play normally (debug level) |
+| `VLC version unknown, guessed <N> from Lua 5.x` | `vlc.misc` is not available to playlist scripts, so the VLC version was guessed from the Lua version (debug level) |
+| `server-side preroll (Ns announced), playing it first` | VLC 3: an ad was detected and is shown as a separate item |
+| `server-side preroll of unknown length, waiting for live` | VLC 3: the ad length is unknown, so the script waits for the live stream without showing the ad |
+| `preroll done, switching to live` | VLC 3: the ad finished, and the script is waiting for live segments |
+| `live content ready after N poll(s), Ns` | VLC 3: the live stream is ready and VLC opens it (debug level) |
+| `variant <N>p chosen` | VLC 3: the quality picked for the preroll workaround (debug level) |
+| `live wait timed out, playback may stall at the ad boundary` | VLC 3: the live stream did not appear in time. A black screen is possible; reopen the URL |
+| `master playlist unreadable, preroll not handled` / `media playlist unreadable, preroll not handled` | VLC 3: a playlist failed to load, so the script runs without the ad workaround |
 
 **Flatpak / Snap:** check whether curl is visible inside the sandbox:
 
@@ -167,18 +179,25 @@ snap run --shell vlc -c 'command -v curl'
 
 If nothing is printed, use a distro-packaged VLC instead.
 
+**VLC 4 shows "playback failed" although the stream plays.** Look for `main error` lines in the log. If they say `TLS session handshake timeout`, this is a network timeout while connecting to Twitch's CDN, not a script error: VLC retries and connects, but loses a few seconds doing so. A common cause is broken IPv6; try `vlc --ipv4 <URL>`.
+
 ## Known limitations
+
+On both VLC 3 and VLC 4:
 
 - **Console flash on Windows.** `io.popen` starts `cmd.exe`, so a console window flashes briefly each time a Twitch URL is opened. This is a limitation of VLC's Lua sandbox. The live wait after an ad opens no console.
 - **HTML download before the script runs.** VLC downloads the twitch.tv HTML page (~200 KB) before `probe()` is called. Playlist scripts run as stream filters on an already-opened URL, so this cannot be avoided.
+- **Subscriber-only content.** Sub-only VODs and streams require an authenticated token, which this script does not support.
+
+On VLC 3 only:
+
 - **Pause after the ad.** About 5–6 s of dark screen pass between the end of the ad and the start of the live stream, because VLC 3 cannot start closer than three segments to the live edge.
 - **Two playlist entries.** While the ad plays, VLC's playlist shows both `[ad]` and the `?vlcresume=…` helper URL.
 - **Several ads in a row.** Only the first ad is shown on screen; for the rest of the break the script waits for the live stream on a dark screen.
-- **Mid-roll ads** are not handled and may cause a black screen or a freeze.
-- **Subscriber-only content.** Sub-only VODs and streams require an authenticated token, which this script does not support.
+- **Mid-roll ads** are not handled and may cause a black screen or a freeze. On VLC 4 mid-rolls play normally.
 
 ## License
 
 GNU General Public License v2.0 or later, the same license as the original VLC script.
 
-Based on the original `twitch.lua` by Marvin Scholz (© 2017 the VideoLAN team). Rewritten in 2026 for the GQL `PlaybackAccessToken` API, with server-side preroll handling added.
+Based on the original `twitch.lua` by Marvin Scholz (© 2017 the VideoLAN team). Rewritten in 2026 for the GQL `PlaybackAccessToken` API, with server-side preroll handling for VLC 3 and VLC 4 support added.
