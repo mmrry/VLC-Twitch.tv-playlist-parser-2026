@@ -95,7 +95,9 @@ local LIVE_EDGE_DELAY_MS = 10000
 
 `LIVE_EDGE_DELAY_MS` sets the distance from the live edge for normal playback (`:adaptive-livedelay`). The default is `10000` (10 s). Twitch segments are 2 s long and are often still being produced when VLC fetches them at the very edge, which causes stalls and rebuffering. `0` keeps VLC's default: lower latency, more stalls.
 
-Right after a server-side ad this margin has no effect: at the start of the session the playlist holds only a few seconds of content, so there is nothing to step back into. On VLC 4 you may therefore see one or two short rebuffers right after a preroll.
+Right after a server-side ad this margin has no effect: at the start of the session the playlist holds only a few seconds of content, so there is nothing to step back into. On VLC 4 you may therefore see one rebuffer right after a preroll (see [Known limitations](#known-limitations)).
+
+`:network-caching` does not help with Twitch HLS: VLC's `adaptive` demuxer still starts with a ~1 s buffer on both VLC 3 and VLC 4. There is no need to add it to `OPTIONS`.
 
 These options apply only to items this script creates. Global VLC settings are not changed.
 
@@ -205,12 +207,13 @@ On both VLC 3 and VLC 4:
 
 On VLC 4 only:
 
-- **Pausing a live stream rewinds it.** VLC's `adaptive` demuxer has no timeshift for live streams (`No timeshift support` in the log). After unpausing, VLC downloads the segments again from the start of the session's live part and replays seconds you have already watched. This is VLC 4.0-dev behavior and the script does not affect it.
+- **Pausing a live stream drops the buffer.** VLC's `adaptive` demuxer has no timeshift for live streams (`No timeshift support` in the log). On pause VLC discards the segments it had already downloaded ahead; on resume it downloads them again from the current playback position and restarts the demuxer. The result is a short rebuffer and extra traffic (~8–10 s of video). This is VLC 4.0-dev behavior and the script does not affect it.
 - **Seek bar on live streams.** VLC 4 shows a seek bar for live streams too, but seeking almost always fails with `not seekable` / `INPUT_CONTROL_SET_POSITION … failed`; sometimes VLC jumps a couple of segments. This is VLC 4.0-dev behavior.
-- **Rebuffering right after an ad.** After a server-side preroll the playlist is short, so `LIVE_EDGE_DELAY_MS` cannot move back from the edge. One or two short stalls are possible in the first seconds of the live stream.
+- **Rebuffering right after an ad.** After a server-side preroll VLC sits right at the live edge, and `LIVE_EDGE_DELAY_MS` cannot move back because the playlist is too short. VLC refreshes the playlist only every ~5 s while segments are 2 s long, so the buffer runs dry in the first seconds of the live stream and one stall of 5–8 s is possible. Playback is steady after that.
 
 On VLC 3 only:
 
+- **Stutter during the ad.** The ad item starts at the first segment, when the playlist holds only ~6 s, and plays at the edge of a growing playlist. Two or three short rebuffers are possible during the ad (`ES_OUT_SET_(GROUP_)PCR is called too late` in the log). The live stream after the ad is not affected.
 - **Pause after the ad.** About 5–6 s of dark screen pass between the end of the ad and the start of the live stream, because VLC 3 cannot start closer than three segments to the live edge.
 - **Two playlist entries.** While the ad plays, VLC's playlist shows both `[ad]` and the `?vlcresume=…` helper URL.
 - **Several ads in a row.** Only the first ad is shown on screen; for the rest of the break the script waits for the live stream on a dark screen.
