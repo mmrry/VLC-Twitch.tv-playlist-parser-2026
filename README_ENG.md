@@ -11,9 +11,10 @@ It replaces the stock `twitch.lua` bundled with VLC. The stock script relies on 
 
 - Plays live channels and VODs anonymously. No login, OAuth token or Client-Integrity is required.
 - Makes one GQL request per open, which returns the access token and the metadata together (title, channel name, category, online status).
-- Fills in VLC metadata: *Title*, *Artist*, *Genre*, *Now Playing* and *Description*.
+- Fills in VLC metadata: *Title*, *Artist*, *Genre*, *Now Playing*, *Description* and *URL*.
 - Prints clear errors to the VLC log for a missing channel, an offline stream, or a forbidden token (for example a geoblock).
 - Starts on the best quality right away. It skips the audio-only variant and uses `adaptive-logic=highest`, so there is no ramp-up from 160p, no demuxer restart and no PCR resync after the stream starts.
+- Stays ~10 s behind the live edge so playback does not stall on segments that are still being written (configurable).
 - **Handles server-side prerolls on VLC 3.** Without this, VLC 3 shows a black screen with no audio once the ad ends. The script plays the ad as a separate item and then switches to the live stream past the break (see [Preroll ads](#preroll-ads)).
 - **Detects the VLC version.** VLC 4 crosses the ad-to-live switch on its own, so the workaround is turned off there automatically: prerolls, the live stream and mid-roll ads all play normally.
 - Runs on Windows, Linux and macOS.
@@ -60,6 +61,8 @@ VLC loads user scripts before the bundled ones, so this file takes over from the
 
 Use the `twitch.lua` source file, not a compiled `.luac`. VLC 3 and VLC 4 bytecode is not compatible (the log shows `bad binary format (version mismatch)`), while the source file works in both.
 
+**VLC 4 and yt-dlp.** VLC 4 has a `ytdl` module that tries a URL before the Lua scripts do. If `yt-dlp` is installed, that module may take over twitch.tv URLs and the script will not run. In that case disable the `ytdl` module in VLC preferences (*Tools → Preferences → All*); see [Troubleshooting](#troubleshooting).
+
 ## Usage
 
 - **GUI:** open *Media → Open Network Stream* (`Ctrl+N`) and paste a channel or VOD URL.
@@ -78,7 +81,7 @@ All settings are constants at the top of the script.
 ```lua
 local OPTIONS            = { ":adaptive-logic=highest" }
 local MAX_HEIGHT         = 0
-local LIVE_EDGE_DELAY_MS = 0
+local LIVE_EDGE_DELAY_MS = 10000
 ```
 
 `OPTIONS` is added to every item the script creates:
@@ -90,7 +93,9 @@ local LIVE_EDGE_DELAY_MS = 0
 
 `MAX_HEIGHT` caps the resolution; `0` means the best available. For normal playback and VODs the value is passed to VLC as `:adaptive-maxheight`. When the preroll workaround kicks in (VLC 3), VLC is given a single media playlist of one quality, and the script picks the variant with the highest resolution (then frame rate, then bitrate) that does not exceed `MAX_HEIGHT`. The order of variants in Twitch's master playlist is not relied on, because it varies.
 
-`LIVE_EDGE_DELAY_MS` sets the distance from the live edge for normal playback (`:adaptive-livedelay`); `0` keeps VLC's default. Twitch segments are 2 s long and are often still being produced when VLC fetches them at the very edge. If the stream stalls and rebuffers, set it to, for example, `15000`: latency goes up, and stalls become rarer.
+`LIVE_EDGE_DELAY_MS` sets the distance from the live edge for normal playback (`:adaptive-livedelay`). The default is `10000` (10 s). Twitch segments are 2 s long and are often still being produced when VLC fetches them at the very edge, which causes stalls and rebuffering. `0` keeps VLC's default: lower latency, more stalls.
+
+Right after a server-side ad this margin has no effect: at the start of the session the playlist holds only a few seconds of content, so there is nothing to step back into. On VLC 4 you may therefore see one or two short rebuffers right after a preroll.
 
 These options apply only to items this script creates. Global VLC settings are not changed.
 
@@ -170,6 +175,8 @@ Open *Tools → Messages* in VLC, or run `vlc -vv`, and look for lines starting 
 | `live wait timed out, playback may stall at the ad boundary` | VLC 3: the live stream did not appear in time. A black screen is possible; reopen the URL |
 | `master playlist unreadable, preroll not handled` / `media playlist unreadable, preroll not handled` | VLC 3: a playlist failed to load, so the script runs without the ad workaround |
 
+**The script does not run on VLC 4 and there are no `Twitch:` lines in the log.** If the `ytdl` module took the URL before `lua debug: Trying Lua scripts` (lines starting with `ytdl`), an installed `yt-dlp` is intercepting twitch.tv. Disable the `ytdl` module: *Tools → Preferences → Show settings: All*, find `ytdl` and turn it off. The line `ytdl debug: cannot start yt-dlp.exe` is harmless: yt-dlp is not installed, and VLC moves on to the Lua scripts.
+
 **Flatpak / Snap:** check whether curl is visible inside the sandbox:
 
 ```sh
@@ -181,13 +188,26 @@ If nothing is printed, use a distro-packaged VLC instead.
 
 **VLC 4 shows "playback failed" although the stream plays.** Look for `main error` lines in the log. If they say `TLS session handshake timeout`, this is a network timeout while connecting to Twitch's CDN, not a script error: VLC retries and connects, but loses a few seconds doing so. A common cause is broken IPv6; try `vlc --ipv4 <URL>`.
 
+### Before sharing a log
+
+The VLC log (`lua debug: Path:`, `gives access`, `creating access` and other lines) contains the full usher URL, including the access token. The token carries **your IP address** (`user_ip`) and a signature (`sig`). This is printed by VLC itself, not by the script.
+
+Before posting a log in an issue, replace the `token=…` and `sig=…` values with `XXX`, or remove those lines. They are not needed for troubleshooting.
+
 ## Known limitations
 
 On both VLC 3 and VLC 4:
 
+- **1080p maximum without logging in.** The anonymous token is capped at `FULL_HD` and 12.5 Mbit/s. Twitch serves 1440p and 4K only to logged-in viewers (`AUTHZ_NOT_LOGGED_IN` in the token).
 - **Console flash on Windows.** `io.popen` starts `cmd.exe`, so a console window flashes briefly each time a Twitch URL is opened. This is a limitation of VLC's Lua sandbox. The live wait after an ad opens no console.
 - **HTML download before the script runs.** VLC downloads the twitch.tv HTML page (~200 KB) before `probe()` is called. Playlist scripts run as stream filters on an already-opened URL, so this cannot be avoided.
 - **Subscriber-only content.** Sub-only VODs and streams require an authenticated token, which this script does not support.
+
+On VLC 4 only:
+
+- **Pausing a live stream rewinds it.** VLC's `adaptive` demuxer has no timeshift for live streams (`No timeshift support` in the log). After unpausing, VLC downloads the segments again from the start of the session's live part and replays seconds you have already watched. This is VLC 4.0-dev behavior and the script does not affect it.
+- **Seek bar on live streams.** VLC 4 shows a seek bar for live streams too, but seeking almost always fails with `not seekable` / `INPUT_CONTROL_SET_POSITION … failed`; sometimes VLC jumps a couple of segments. This is VLC 4.0-dev behavior.
+- **Rebuffering right after an ad.** After a server-side preroll the playlist is short, so `LIVE_EDGE_DELAY_MS` cannot move back from the edge. One or two short stalls are possible in the first seconds of the live stream.
 
 On VLC 3 only:
 
