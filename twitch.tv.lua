@@ -31,7 +31,7 @@ local USHER_URL = "https://usher.ttvnw.net"
 local IS_WIN    = package.config:sub(1, 1) == "\\"
 -- Start on the best variant instead of ramping up from 160p
 -- (avoids a demuxer/decoder restart and PCR resync right after start)
-local OPTIONS = { ":adaptive-logic=highest", ":network-caching=3000" } --OR :adaptive-logic=nearoptimal
+local OPTIONS = { ":adaptive-logic=highest" } --OR :adaptive-logic=nearoptimal
 -- Highest resolution to play. 0 = best available (source/1080p60).
 -- Used for the preroll workaround (picks a media playlist) and passed to
 -- VLC as :adaptive-maxheight for normal playback.
