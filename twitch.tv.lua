@@ -37,10 +37,12 @@ local OPTIONS   = { ":adaptive-logic=highest" } --OR :adaptive-logic=nearoptimal
 -- VLC as :adaptive-maxheight for normal playback.
 local MAX_HEIGHT = 0
 -- Distance from the live edge for normal playback, in ms.
--- 0 = VLC default. Larger values (e.g. 15000) trade latency for fewer stalls:
--- Twitch segments are 2s long and are often still being produced when VLC
--- fetches them at the very edge.
-local LIVE_EDGE_DELAY_MS = 0
+-- 0 = VLC default. Twitch segments are 2s long and are often still being
+-- produced when VLC fetches them at the very edge, which causes stalls.
+-- 10000 trades ~10s of latency for steadier playback. It cannot take effect
+-- right after a server-side preroll: the session playlist then starts with
+-- only a few seconds of content, so there is nothing to step back into.
+local LIVE_EDGE_DELAY_MS = 10000
 
 -- Preroll handling (VLC 3 only).
 -- With server_ads=true Twitch stitches ads into the HLS playlist. The ad->live
@@ -89,6 +91,11 @@ end
 local function fail(msg)
     vlc.msg.err("Twitch: " .. msg)
     return {}
+end
+
+-- Full URL of the page being parsed (vlc.path carries no scheme)
+local function page_url()
+    return vlc.access .. "://" .. vlc.path
 end
 
 -- Major VLC version (3, 4, ...).
@@ -442,7 +449,7 @@ local function parse_video(video_id)
         path    = usher_url("/vod/" .. video_id .. ".m3u8", token),
         options = item_options(extra),
         name = "Twitch: " .. video_id,
-        url  = vlc.path,
+        url  = page_url(),
     }
 
     local video = data.video
@@ -487,7 +494,7 @@ local function parse_stream(channel)
         nowplaying  = game and (user.displayName .. " playing " .. game),
         genre       = game,
         description = bs.title,
-        url         = vlc.path,
+        url         = page_url(),
     }
 
     -- VLC 4 handles the ad->live discontinuity itself (ad shown, then live,
